@@ -1,0 +1,17 @@
+# Secrets
+.env
+wordpress_oauth.json
+
+# Virtual environment
+venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Generated content
+images/
+outputs/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
