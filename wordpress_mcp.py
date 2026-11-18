@@ -198,13 +198,17 @@ async def handle_callback():
     global _callback_result
 
     loop = asyncio.get_running_loop()
-
     _callback_result = loop.create_future()
 
     callback_status.value = (
-        "<b>Waiting for WordPress authorization...</b> "
-        "Paste the redirected URL and click Submit."
+        "<b>Waiting for WordPress authorization...</b><br>"
+        "1. Approve access in your browser.<br>"
+        "2. Copy the complete redirected URL.<br>"
+        "3. Paste it below and click Submit."
     )
+
+    # Display the URL input widget in the notebook.
+    display(auth_callback_widget)
 
     try:
         result = await _callback_result
@@ -254,6 +258,95 @@ class WordPressMCPClient:
         self.session = None
         self.exit_stack = None
 
+    async def _prepare_oauth_metadata(self):
+        """Discover OAuth metadata before the first token refresh."""
+
+        provider = self.oauth_provider
+        context = provider.context
+
+        # Load previously saved credentials.
+        if not provider._initialized:
+            await provider._initialize()
+
+        # Do not repeat discovery if already completed.
+        if context.oauth_metadata is not None:
+            return
+
+        # Use the SDK's own metadata-discovery helpers.
+        helpers = type(provider)._auth_flow.__globals__
+
+        build_urls = helpers[
+            "build_oauth_authorization_server_metadata_discovery_urls"
+        ]
+        create_request = helpers["create_oauth_metadata_request"]
+        handle_response = helpers["handle_auth_metadata_response"]
+
+        # First discover the protected resource's authorization server.
+        build_resource_urls = helpers[
+            "build_protected_resource_metadata_discovery_urls"
+        ]
+        handle_resource = helpers["handle_protected_resource_response"]
+
+        async with httpx2.AsyncClient(
+            follow_redirects=False,
+            timeout=30.0,
+        ) as client:
+
+            for url in build_resource_urls(None, WORDPRESS_MCP_URL):
+                response = await client.send(create_request(url))
+                resource_metadata = await handle_resource(response)
+
+                if resource_metadata is not None:
+                    context.protected_resource_metadata = resource_metadata
+
+                    context.auth_server_url = (
+                        provider._select_authorization_server(
+                            [str(url) for url in resource_metadata.authorization_servers]
+                        )
+                    )
+                    break
+
+            # Discover the authorization server's token endpoint.
+            urls = build_urls(
+                context.auth_server_url,
+                WORDPRESS_MCP_URL,
+            )
+
+            for url in urls:
+                response = await client.send(create_request(url))
+                should_continue, metadata = await handle_response(response)
+
+                if metadata is not None:
+                    # Validate the discovered issuer before trusting endpoints.
+                    expected_issuer = provider._expected_issuer()
+
+                    if context.auth_server_url is None:
+                        if helpers["issuers_match"](
+                            str(metadata.issuer), expected_issuer
+                        ):
+                            expected_issuer = str(metadata.issuer)
+
+                    helpers["validate_metadata_issuer"](
+                        metadata, expected_issuer
+                    )
+
+                    context.oauth_metadata = metadata
+                    break
+
+                if not should_continue:
+                    raise RuntimeError(
+                        f"OAuth metadata discovery failed: HTTP {response.status_code}"
+                    )
+
+        if context.oauth_metadata is None:
+            raise RuntimeError(
+                "Could not discover WordPress OAuth metadata."
+            )
+
+        print(
+            "OAuth token endpoint:",
+            context.oauth_metadata.token_endpoint,
+        )
     # --------------------------------------------------------
     # CONNECT
     # --------------------------------------------------------
@@ -262,6 +355,9 @@ class WordPressMCPClient:
 
         if self.session is not None:
             return
+        
+         # NEW: Discover OAuth metadata before automatic refresh.
+        await self._prepare_oauth_metadata()
 
         self.exit_stack = AsyncExitStack()
 
