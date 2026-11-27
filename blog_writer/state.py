@@ -4,6 +4,11 @@ from typing import Annotated, List, Optional, TypedDict
 from blog_writer.models import EvidenceItem, Plan
 
 
+class SectionResult(TypedDict):
+    task_id: int
+    markdown: str
+
+
 class State(TypedDict):
     topic: str
 
@@ -19,7 +24,7 @@ class State(TypedDict):
     recency_days: int
 
     # workers
-    sections: Annotated[List[tuple[int, str]], operator.add]  # (task_id, section_md)
+    sections: Annotated[List[SectionResult], operator.add]
 
     # reducer/image
     merged_md: str

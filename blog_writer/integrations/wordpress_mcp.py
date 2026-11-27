@@ -1,10 +1,8 @@
 
 import json
-import webbrowser
-
-from pathlib import Path
-from urllib.parse import urlparse, parse_qs
 from contextlib import AsyncExitStack
+from collections.abc import Awaitable, Callable
+from typing import Protocol
 
 import httpx2
 
@@ -13,21 +11,18 @@ from pydantic import AnyUrl
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.client.auth import OAuthClientProvider
-import asyncio
-import ipywidgets as widgets
-
-from IPython.display import display
-
 from mcp.shared.auth import (
-    OAuthClientMetadata,
     AuthorizationCodeResult,
     OAuthClientInformationFull,
-    OAuthToken
+    OAuthClientMetadata,
+    OAuthToken,
 )
 
-# ============================================================
-# 1. CONFIGURATION
-# ============================================================
+from blog_writer.integrations.wordpress_oauth import (
+    FileTokenStorage,
+    OAuthAuthorizationFlow,
+    parse_callback_url,
+)
 
 WORDPRESS_MCP_URL = (
     "https://public-api.wordpress.com/wpcom/v2/mcp/v1"
@@ -38,207 +33,60 @@ WORDPRESS_SITE = "https://buildwithadithi.wordpress.com"
 REDIRECT_URI = "http://localhost:8080/callback"
 
 
-# ============================================================
-# 2. TOKEN STORAGE
-# ============================================================
+_notebook_redirect_handler: Callable[[str], Awaitable[None]] | None = None
+_notebook_callback_handler: Callable[[], Awaitable[AuthorizationCodeResult]] | None = None
 
-class FileTokenStorage:
 
-    def __init__(self, file_path="wordpress_oauth.json"):
+class OAuthTokenStorage(Protocol):
+    async def get_tokens(self) -> OAuthToken | None: ...
 
-        self.file_path = (
-            Path(__file__).resolve().parents[2] / file_path
-        )
+    async def set_tokens(self, tokens: OAuthToken) -> None: ...
 
-    def _load(self):
-
-        if not self.file_path.exists():
-            return {}
-
-        return json.loads(
-            self.file_path.read_text(encoding="utf-8")
-        )
-
-    def _save(self, data):
-
-        self.file_path.write_text(
-            json.dumps(data, indent=2),
-            encoding="utf-8"
-        )
-
-    async def get_tokens(self) -> OAuthToken | None:
-
-        data = self._load()
-        tokens = data.get("tokens")
-
-        if tokens is None:
-            return None
-
-        return OAuthToken.model_validate(tokens)
-
-    async def set_tokens(self, tokens: OAuthToken):
-
-        data = self._load()
-
-        data["tokens"] = tokens.model_dump(
-            mode="json",
-            exclude_none=True
-        )
-
-        self._save(data)
-
-    async def get_client_info(
-        self
-    ) -> OAuthClientInformationFull | None:
-
-        data = self._load()
-        client_info = data.get("client_info")
-
-        if client_info is None:
-            return None
-
-        return OAuthClientInformationFull.model_validate(
-            client_info
-        )
+    async def get_client_info(self) -> OAuthClientInformationFull | None: ...
 
     async def set_client_info(
         self,
-        client_info: OAuthClientInformationFull
-    ):
-
-        data = self._load()
-
-        data["client_info"] = client_info.model_dump(
-            mode="json",
-            exclude_none=True
-        )
-
-        self._save(data)
+        client_info: OAuthClientInformationFull,
+    ) -> None: ...
 
 
-# ============================================================
-# 3. OAUTH HANDLERS
-# ============================================================
-
-async def handle_redirect(auth_url: str):
-
-    print("Opening WordPress authorization page...")
-
-    webbrowser.open(auth_url)
+def register_notebook_oauth_handlers(
+    redirect_handler: Callable[[str], Awaitable[None]],
+    callback_handler: Callable[[], Awaitable[AuthorizationCodeResult]],
+) -> None:
+    global _notebook_redirect_handler, _notebook_callback_handler
+    _notebook_redirect_handler = redirect_handler
+    _notebook_callback_handler = callback_handler
 
 
-
-
-def _parse_callback_url(callback_url):
-    params = parse_qs(
-        urlparse(callback_url).query
-    )
-
-    if "error" in params:
-        raise ValueError(
-            f"Authorization failed: {params['error'][0]}"
-        )
-
-    if "code" not in params:
-        raise ValueError(
-            "Authorization code not found."
-        )
-
-    return AuthorizationCodeResult(
-        code=params["code"][0],
-        state=params.get("state", [None])[0],
-        iss=params.get("iss", [None])[0]
+async def _missing_redirect_handler(_: str) -> None:
+    raise RuntimeError(
+        "Start authorization with WordPressMCPClient.get_authorization_url()."
     )
 
 
-_callback_result: asyncio.Future | None = None
-callback_url_input = widgets.Text(
-    description="Redirect URL:",
-    placeholder="Paste the complete redirected URL here",
-    layout=widgets.Layout(width="100%")
-)
-callback_status = widgets.HTML(
-    "Click <b>Approve</b>, authorize WordPress, then paste the redirected URL here."
-)
-
-
-def _submit_callback_url(_):
-    if _callback_result is None or _callback_result.done():
-        callback_status.value = (
-            "Waiting for the workflow to start WordPress authorization. "
-            "Click <b>Approve</b> first."
-        )
-        return
-
-    try:
-        result = _parse_callback_url(callback_url_input.value.strip())
-    except ValueError as exc:
-        callback_status.value = f"<span style='color: red'>{exc}</span>"
-        return
-
-    callback_url_input.value = ""
-    callback_status.value = "Authorization URL submitted."
-    _callback_result.set_result(result)
-
-
-callback_submit_button = widgets.Button(
-    description="Submit authorization URL",
-    button_style="primary"
-)
-callback_submit_button.on_click(_submit_callback_url)
-callback_url_input.on_submit(_submit_callback_url)
-auth_callback_widget = widgets.VBox([
-    callback_status,
-    callback_url_input,
-    callback_submit_button
-])
-
-
-async def handle_callback():
-    global _callback_result
-
-    loop = asyncio.get_running_loop()
-    _callback_result = loop.create_future()
-
-    callback_status.value = (
-        "<b>Waiting for WordPress authorization...</b><br>"
-        "1. Approve access in your browser.<br>"
-        "2. Copy the complete redirected URL.<br>"
-        "3. Paste it below and click Submit."
+async def _missing_callback_handler() -> AuthorizationCodeResult:
+    raise RuntimeError(
+        "Complete authorization with WordPressMCPClient.handle_oauth_callback()."
     )
 
-    # Display the URL input widget in the notebook.
-    display(auth_callback_widget)
-
-    try:
-        result = await _callback_result
-
-        callback_status.value = (
-            "<span style='color:green'>"
-            "Authorization code received. Connecting to WordPress..."
-            "</span>"
-        )
-
-        return result
-
-    finally:
-        _callback_result = None
-
-
-
-# ============================================================
-# 4. WORDPRESS MCP CLIENT
-# ============================================================
 
 class WordPressMCPClient:
-
-    def __init__(self):
-
-        self.token_storage = FileTokenStorage()
+    def __init__(
+        self,
+        *,
+        redirect_uri: str = REDIRECT_URI,
+        token_storage: OAuthTokenStorage | None = None,
+        redirect_handler: Callable[[str], Awaitable[None]] | None = None,
+        callback_handler: Callable[[], Awaitable[AuthorizationCodeResult]] | None = None,
+    ):
+        self.token_storage = (
+            token_storage if token_storage is not None else FileTokenStorage()
+        )
 
         self.client_metadata = OAuthClientMetadata(
             client_name="Blog Writing Agent",
-            redirect_uris=[AnyUrl(REDIRECT_URI)],
+            redirect_uris=[AnyUrl(redirect_uri)],
             grant_types=[
                 "authorization_code",
                 "refresh_token"
@@ -251,12 +99,36 @@ class WordPressMCPClient:
             server_url=WORDPRESS_MCP_URL,
             client_metadata=self.client_metadata,
             storage=self.token_storage,
-            redirect_handler=handle_redirect,
-            callback_handler=handle_callback
+            redirect_handler=(
+                redirect_handler
+                or _notebook_redirect_handler
+                or _missing_redirect_handler
+            ),
+            callback_handler=(
+                callback_handler
+                or _notebook_callback_handler
+                or _missing_callback_handler
+            ),
         )
 
         self.session = None
         self.exit_stack = None
+        self.authorization_flow = OAuthAuthorizationFlow(
+            self.oauth_provider,
+            lambda: self.connect(),
+        )
+
+    async def get_authorization_url(self) -> str | None:
+        """Start the MCP OAuth flow and return its authorization URL, if needed."""
+        return await self.authorization_flow.get_authorization_url()
+
+    async def handle_oauth_callback(self, callback_url: str) -> None:
+        """Validate and complete the pending OAuth callback and token exchange."""
+        await self.authorization_flow.handle_callback(callback_url)
+
+    async def cancel_oauth(self) -> None:
+        """Cancel an authorization flow that is waiting for its callback."""
+        await self.authorization_flow.cancel()
 
     async def _prepare_oauth_metadata(self):
         """Discover OAuth metadata before the first token refresh."""
@@ -343,10 +215,6 @@ class WordPressMCPClient:
                 "Could not discover WordPress OAuth metadata."
             )
 
-        print(
-            "OAuth token endpoint:",
-            context.oauth_metadata.token_endpoint,
-        )
     # --------------------------------------------------------
     # CONNECT
     # --------------------------------------------------------
@@ -390,7 +258,7 @@ class WordPressMCPClient:
 
             print("Connected to WordPress!")
 
-        except Exception:
+        except BaseException:
 
             await self.exit_stack.aclose()
 
@@ -404,6 +272,8 @@ class WordPressMCPClient:
     # --------------------------------------------------------
 
     async def close(self):
+
+        await self.authorization_flow.cancel()
 
         if self.exit_stack is not None:
 
@@ -681,3 +551,23 @@ class WordPressMCPClient:
             print("\nURL:", post["link"])
 
         print("=" * 38)
+
+
+_parse_callback_url = parse_callback_url
+
+
+def __getattr__(name: str):
+    notebook_exports = {
+        "auth_callback_widget",
+        "callback_status",
+        "callback_url_input",
+        "callback_submit_button",
+        "handle_redirect",
+        "handle_callback",
+    }
+    if name not in notebook_exports:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+    from blog_writer.integrations import wordpress_notebook
+
+    return getattr(wordpress_notebook, name)

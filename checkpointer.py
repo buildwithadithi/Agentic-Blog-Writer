@@ -5,6 +5,8 @@ from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
+from blog_writer.serialization import create_checkpoint_serializer
+
 load_dotenv()
 
 DB_URI = os.getenv("SUPABASE_DB_URI")
@@ -27,7 +29,10 @@ async def initialize_checkpointer():
 
     await connection_pool.open()
 
-    checkpointer = AsyncPostgresSaver(connection_pool)
+    checkpointer = AsyncPostgresSaver(
+        connection_pool,
+        serde=create_checkpoint_serializer(),
+    )
     await checkpointer.setup()
 
     return connection_pool, checkpointer

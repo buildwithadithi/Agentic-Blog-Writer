@@ -88,4 +88,11 @@ def worker_node(payload: dict) -> dict:
             if isinstance(block, dict) and block.get("type") == "text"
         ).strip()
 
-    return {"sections": [(task.id, section_md)]}
+    return {
+        "sections": [
+            {
+                "task_id": task.id,
+                "markdown": section_md,
+            }
+        ]
+    }

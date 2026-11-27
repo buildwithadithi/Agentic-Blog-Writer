@@ -1,3 +1,5 @@
+import asyncio
+import inspect
 from datetime import date
 from typing import Any, Dict, Optional
 from uuid import uuid4
@@ -19,10 +21,12 @@ def build_workflow_graph(checkpointer=None):
     return build_graph(checkpointer=checkpointer)
 
 
-def close_checkpointer(connection_pool):
-    """Close an initialized connection pool when the application lifecycle ends."""
+async def close_checkpointer(connection_pool):
+    """Close an initialized connection pool, awaiting asynchronous pool closes."""
     if connection_pool is not None:
-        connection_pool.close()
+        result = connection_pool.close()
+        if inspect.isawaitable(result):
+            await result
 
 
 def make_thread_config(thread_id: Optional[str] = None) -> Dict[str, Any]:
@@ -84,24 +88,9 @@ def _workflow_response(
     }
 
 
-async def start_workflow(
-    topic: str,
-    as_of: Optional[str] = None,
-    thread_id: Optional[str] = None,
-    *,
-    graph=None,
-    checkpointer=None,
-):
-    """Start a new workflow and return its thread and interrupt/completion state."""
-    if graph is None:
-        if checkpointer is None:
-            _, checkpointer = await initialize_checkpointer()
-        graph = build_workflow_graph(checkpointer)
-
-    thread = make_thread_config(thread_id)
+def _initial_state(topic: str, as_of: Optional[str] = None) -> Dict[str, Any]:
     resolved_as_of = as_of or date.today().isoformat()
-
-    initial_state = {
+    return {
         "topic": topic,
         "mode": "",
         "needs_research": False,
@@ -124,8 +113,166 @@ async def start_workflow(
         "wordpress_status": None,
     }
 
-    result = await graph.ainvoke(initial_state, config=thread["config"])
+
+async def _start_on_graph(
+    graph,
+    topic: str,
+    as_of: Optional[str],
+    thread_id: Optional[str],
+):
+    thread = make_thread_config(thread_id)
+    result = await graph.ainvoke(
+        _initial_state(topic, as_of),
+        config=thread["config"],
+    )
     return _workflow_response(thread["thread_id"], result)
+
+
+async def _resume_on_graph(graph, thread_id: str, payload: Dict[str, Any]):
+    thread = make_thread_config(thread_id)
+    result = await graph.ainvoke(
+        Command(resume=payload),
+        config=thread["config"],
+    )
+    return _workflow_response(thread["thread_id"], result)
+
+
+class WorkflowRuntime:
+    """Owns the checkpointer resources and graph for an application's lifetime."""
+
+    def __init__(self, connection_pool, checkpointer, graph):
+        self.connection_pool = connection_pool
+        self.checkpointer = checkpointer
+        self.graph = graph
+        self._active_workflows = 0
+        self._closing = False
+        self._closed = False
+        self._condition = asyncio.Condition()
+        self._shutdown_lock = asyncio.Lock()
+
+    @classmethod
+    async def initialize(cls):
+        """Initialize one pool/checkpointer pair and compile one reusable graph."""
+        connection_pool, checkpointer = await initialize_checkpointer()
+        try:
+            graph = build_workflow_graph(checkpointer)
+        except Exception:
+            await close_checkpointer(connection_pool)
+            raise
+        return cls(connection_pool, checkpointer, graph)
+
+    @classmethod
+    def from_checkpointer(cls, checkpointer, graph=None):
+        """Create a pool-less runtime, for example with LangGraph MemorySaver."""
+        compiled_graph = graph if graph is not None else build_workflow_graph(checkpointer)
+        return cls(None, checkpointer, compiled_graph)
+
+    async def _begin_workflow(self):
+        async with self._condition:
+            if self._closing or self._closed:
+                raise RuntimeError("Workflow runtime is shutting down or already closed.")
+            self._active_workflows += 1
+
+    async def _end_workflow(self):
+        async with self._condition:
+            self._active_workflows -= 1
+            if self._active_workflows == 0:
+                self._condition.notify_all()
+
+    async def start_workflow(
+        self,
+        topic: str,
+        as_of: Optional[str] = None,
+        thread_id: Optional[str] = None,
+    ):
+        await self._begin_workflow()
+        try:
+            return await _start_on_graph(self.graph, topic, as_of, thread_id)
+        finally:
+            await self._end_workflow()
+
+    async def resume_workflow(self, thread_id: str, payload: Dict[str, Any]):
+        await self._begin_workflow()
+        try:
+            return await _resume_on_graph(self.graph, thread_id, payload)
+        finally:
+            await self._end_workflow()
+
+    async def shutdown(self):
+        """Reject new work, wait for in-flight calls, then close the pool once."""
+        async with self._shutdown_lock:
+            if self._closed:
+                return
+
+            async with self._condition:
+                self._closing = True
+                await self._condition.wait_for(
+                    lambda: self._active_workflows == 0
+                )
+
+            try:
+                await close_checkpointer(self.connection_pool)
+            except Exception:
+                async with self._condition:
+                    self._closing = False
+                    self._condition.notify_all()
+                raise
+
+            async with self._condition:
+                self._closed = True
+                self._condition.notify_all()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        await self.shutdown()
+
+
+_default_runtime: Optional[WorkflowRuntime] = None
+_default_runtime_lock = asyncio.Lock()
+
+
+async def initialize_workflow_runtime() -> WorkflowRuntime:
+    """Initialize and retain the process-default runtime, or return it if ready."""
+    global _default_runtime
+    async with _default_runtime_lock:
+        if _default_runtime is None or _default_runtime._closed:
+            _default_runtime = await WorkflowRuntime.initialize()
+        return _default_runtime
+
+
+async def shutdown_workflow_runtime():
+    """Shut down the process-default runtime during application shutdown."""
+    global _default_runtime
+    async with _default_runtime_lock:
+        if _default_runtime is not None:
+            await _default_runtime.shutdown()
+            _default_runtime = None
+
+
+async def start_workflow(
+    topic: str,
+    as_of: Optional[str] = None,
+    thread_id: Optional[str] = None,
+    *,
+    graph=None,
+    checkpointer=None,
+    runtime: Optional[WorkflowRuntime] = None,
+):
+    """Start a workflow using an explicit runtime or graph, or the shared default."""
+    if runtime is not None:
+        if graph is not None or checkpointer is not None:
+            raise ValueError("Pass runtime, graph, or checkpointer, not multiple.")
+        return await runtime.start_workflow(topic, as_of, thread_id)
+
+    if graph is None:
+        if checkpointer is not None:
+            graph = build_workflow_graph(checkpointer)
+        else:
+            runtime = await initialize_workflow_runtime()
+            return await runtime.start_workflow(topic, as_of, thread_id)
+    return await _start_on_graph(graph, topic, as_of, thread_id)
 
 
 async def resume_workflow(
@@ -134,16 +281,18 @@ async def resume_workflow(
     *,
     graph=None,
     checkpointer=None,
+    runtime: Optional[WorkflowRuntime] = None,
 ):
-    """Resume a paused workflow using the same LangGraph thread ID."""
-    if graph is None:
-        if checkpointer is None:
-            _, checkpointer = await initialize_checkpointer()
-        graph = build_workflow_graph(checkpointer)
+    """Resume using an explicit runtime or graph, or the shared default."""
+    if runtime is not None:
+        if graph is not None or checkpointer is not None:
+            raise ValueError("Pass runtime, graph, or checkpointer, not multiple.")
+        return await runtime.resume_workflow(thread_id, payload)
 
-    thread = make_thread_config(thread_id)
-    result = await graph.ainvoke(
-        Command(resume=payload),
-        config=thread["config"],
-    )
-    return _workflow_response(thread["thread_id"], result)
+    if graph is None:
+        if checkpointer is not None:
+            graph = build_workflow_graph(checkpointer)
+        else:
+            runtime = await initialize_workflow_runtime()
+            return await runtime.resume_workflow(thread_id, payload)
+    return await _resume_on_graph(graph, thread_id, payload)
