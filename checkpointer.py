@@ -27,12 +27,22 @@ async def initialize_checkpointer():
         open=False,
     )
 
-    await connection_pool.open()
+    try:
+        await connection_pool.open()
 
-    checkpointer = AsyncPostgresSaver(
-        connection_pool,
-        serde=create_checkpoint_serializer(),
-    )
-    await checkpointer.setup()
+        checkpointer = AsyncPostgresSaver(
+            connection_pool,
+            serde=create_checkpoint_serializer(),
+        )
+        await checkpointer.setup()
+    except BaseException as initialization_error:
+        try:
+            await connection_pool.close()
+        except Exception as close_error:
+            initialization_error.add_note(
+                "Closing the PostgreSQL connection pool also failed "
+                f"({type(close_error).__name__})."
+            )
+        raise
 
     return connection_pool, checkpointer

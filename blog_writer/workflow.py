@@ -1,12 +1,17 @@
 import asyncio
 import inspect
+import re
+from collections import defaultdict, deque
 from datetime import date
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 from uuid import uuid4
 
 from langgraph.types import Command
 
 from blog_writer.graph import build_graph
+
+
+ProgressCallback = Callable[[Dict[str, Any]], None]
 
 
 async def initialize_checkpointer():
@@ -88,6 +93,72 @@ def _workflow_response(
     }
 
 
+def _workflow_state_response(thread_id: str, snapshot: Any) -> Dict[str, Any]:
+    values = snapshot.values
+    if not isinstance(values, dict):
+        raise TypeError("Checkpoint state must be a mapping.")
+
+    tasks = snapshot.tasks
+    interrupts = snapshot.interrupts
+    has_checkpoint = bool(
+        snapshot.metadata is not None
+        or snapshot.created_at is not None
+        or values
+        or snapshot.next
+        or tasks
+        or interrupts
+    )
+    interrupted_tasks = [
+        task.name
+        for task in tasks
+        if getattr(task, "interrupts", ())
+    ]
+
+    if not has_checkpoint:
+        status = "not_found"
+    elif any(getattr(task, "error", None) for task in tasks):
+        status = "failed"
+    elif interrupts and "human_review" in interrupted_tasks:
+        status = "paused_for_review"
+    elif interrupts:
+        status = "interrupted"
+    elif snapshot.next:
+        status = "in_progress"
+    else:
+        status = "completed"
+
+    final = values.get("final", "")
+    image_references = (
+        re.findall(r'<img\b[^>]*\bsrc=["\']([^"\']+)["\']', final, re.IGNORECASE)
+        if isinstance(final, str)
+        else []
+    )
+
+    return {
+        "thread_id": thread_id,
+        "status": status,
+        "topic": values.get("topic"),
+        "plan": _serialize(values.get("plan")),
+        "evidence": _serialize(values.get("evidence", [])),
+        "sections": _serialize(values.get("sections", [])),
+        "final": final,
+        "image_specs": _serialize(values.get("image_specs", [])),
+        "image_references": image_references,
+        "review_status": values.get("review_status", ""),
+        "revision_count": values.get("revision_count", 0),
+        "wordpress_post_id": values.get("wordpress_post_id"),
+        "wordpress_post_url": values.get("wordpress_post_url"),
+        "wordpress_status": values.get("wordpress_status"),
+        "next": list(snapshot.next),
+        "interrupted_at": interrupted_tasks,
+        "interrupts": [
+            _serialize(interrupt.value)
+            for interrupt in interrupts
+        ],
+        "created_at": snapshot.created_at,
+    }
+
+
 def _initial_state(topic: str, as_of: Optional[str] = None) -> Dict[str, Any]:
     resolved_as_of = as_of or date.today().isoformat()
     return {
@@ -114,24 +185,167 @@ def _initial_state(topic: str, as_of: Optional[str] = None) -> Dict[str, Any]:
     }
 
 
+async def _stream_graph(graph, input_value, thread, progress_callback: ProgressCallback):
+    pending_by_node = defaultdict(deque)
+    pending_by_section = defaultdict(deque)
+    worker_info = {}
+
+    async for part in graph.astream(
+        input_value,
+        config=thread["config"],
+        stream_mode=["updates", "debug"],
+        subgraphs=True,
+        version="v2",
+    ):
+        event_type = part.get("type")
+        data = part.get("data", {})
+
+        if event_type == "debug":
+            debug_type = data.get("type")
+            payload = data.get("payload", {})
+            node = payload.get("name")
+            execution_id = payload.get("id")
+            if not node or not execution_id:
+                continue
+
+            if debug_type == "task":
+                pending_by_node[node].append(execution_id)
+                event = {
+                    "event": "node_started",
+                    "node": node,
+                    "execution_id": execution_id,
+                }
+                if node == "worker":
+                    worker_input = payload.get("input", {})
+                    task = worker_input.get("task", {})
+                    section_id = task.get("id")
+                    section_title = task.get("title")
+                    worker_info[execution_id] = {
+                        "section_id": section_id,
+                        "section_title": section_title,
+                    }
+                    if section_id is not None:
+                        pending_by_section[section_id].append(execution_id)
+                        event["section_id"] = section_id
+                    if section_title:
+                        event["section_title"] = section_title
+                progress_callback(event)
+            elif debug_type == "task_result":
+                if payload.get("interrupts"):
+                    event_name = "node_interrupted"
+                elif payload.get("error") is not None:
+                    event_name = "node_failed"
+                else:
+                    continue
+
+                event = {
+                    "event": event_name,
+                    "node": node,
+                    "execution_id": execution_id,
+                }
+                event.update(worker_info.pop(execution_id, {}))
+                progress_callback(event)
+
+        elif event_type == "updates":
+            for node, update in data.items():
+                if node == "__interrupt__" or not isinstance(update, dict):
+                    continue
+
+                if node == "orchestrator":
+                    plan = _serialize(update.get("plan"))
+                    tasks = plan.get("tasks", []) if isinstance(plan, dict) else []
+                    progress_callback(
+                        {
+                            "event": "plan_ready",
+                            "node": node,
+                            "section_total": len(tasks),
+                            "section_titles": [
+                                task.get("title", "")
+                                for task in tasks
+                                if isinstance(task, dict)
+                            ],
+                        }
+                    )
+
+                if node == "worker":
+                    sections = update.get("sections", [])
+                    for section in sections:
+                        if not isinstance(section, dict):
+                            continue
+                        section_id = section.get("task_id")
+                        executions = pending_by_section.get(section_id)
+                        execution_id = executions.popleft() if executions else None
+                        event = {
+                            "event": "node_completed",
+                            "node": node,
+                            "execution_id": execution_id,
+                            "section_id": section_id,
+                        }
+                        if execution_id is not None:
+                            event.update(worker_info.pop(execution_id, {}))
+                        progress_callback(event)
+                    continue
+
+                executions = pending_by_node.get(node)
+                execution_id = executions.popleft() if executions else None
+                worker_info.pop(execution_id, None)
+                progress_callback(
+                    {
+                        "event": "node_completed",
+                        "node": node,
+                        "execution_id": execution_id,
+                    }
+                )
+
+    snapshot = await graph.aget_state(thread["config"])
+    result = dict(snapshot.values)
+    if snapshot.interrupts:
+        result["__interrupt__"] = list(snapshot.interrupts)
+    return _workflow_response(thread["thread_id"], result)
+
+
 async def _start_on_graph(
     graph,
     topic: str,
     as_of: Optional[str],
     thread_id: Optional[str],
+    progress_callback: Optional[ProgressCallback] = None,
 ):
     thread = make_thread_config(thread_id)
+    initial_state = _initial_state(topic, as_of)
+    if progress_callback is not None:
+        return await _stream_graph(
+            graph,
+            initial_state,
+            thread,
+            progress_callback,
+        )
+
     result = await graph.ainvoke(
-        _initial_state(topic, as_of),
+        initial_state,
         config=thread["config"],
     )
     return _workflow_response(thread["thread_id"], result)
 
 
-async def _resume_on_graph(graph, thread_id: str, payload: Dict[str, Any]):
+async def _resume_on_graph(
+    graph,
+    thread_id: str,
+    payload: Dict[str, Any],
+    progress_callback: Optional[ProgressCallback] = None,
+):
     thread = make_thread_config(thread_id)
+    resume_command = Command(resume=payload)
+    if progress_callback is not None:
+        return await _stream_graph(
+            graph,
+            resume_command,
+            thread,
+            progress_callback,
+        )
+
     result = await graph.ainvoke(
-        Command(resume=payload),
+        resume_command,
         config=thread["config"],
     )
     return _workflow_response(thread["thread_id"], result)
@@ -191,10 +405,58 @@ class WorkflowRuntime:
         finally:
             await self._end_workflow()
 
+    async def start_workflow_stream(
+        self,
+        topic: str,
+        as_of: Optional[str],
+        thread_id: str,
+        progress_callback: ProgressCallback,
+    ):
+        await self._begin_workflow()
+        try:
+            return await _start_on_graph(
+                self.graph,
+                topic,
+                as_of,
+                thread_id,
+                progress_callback,
+            )
+        finally:
+            await self._end_workflow()
+
     async def resume_workflow(self, thread_id: str, payload: Dict[str, Any]):
         await self._begin_workflow()
         try:
             return await _resume_on_graph(self.graph, thread_id, payload)
+        finally:
+            await self._end_workflow()
+
+    async def resume_workflow_stream(
+        self,
+        thread_id: str,
+        payload: Dict[str, Any],
+        progress_callback: ProgressCallback,
+    ):
+        await self._begin_workflow()
+        try:
+            return await _resume_on_graph(
+                self.graph,
+                thread_id,
+                payload,
+                progress_callback,
+            )
+        finally:
+            await self._end_workflow()
+
+    async def get_workflow_state(self, thread_id: str) -> Dict[str, Any]:
+        if not isinstance(thread_id, str) or not thread_id.strip():
+            raise ValueError("thread_id must be a non-empty string.")
+
+        thread = make_thread_config(thread_id)
+        await self._begin_workflow()
+        try:
+            snapshot = await self.graph.aget_state(thread["config"])
+            return _workflow_state_response(thread["thread_id"], snapshot)
         finally:
             await self._end_workflow()
 

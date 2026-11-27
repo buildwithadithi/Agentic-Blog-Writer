@@ -1,14 +1,23 @@
 from typing import List
 
-from langchain_community.tools.tavily_search import TavilySearchResults
+from langchain_tavily import TavilySearch
 
 
 def _tavily_search(query: str, max_results: int = 5) -> List[dict]:
-    tool = TavilySearchResults(max_results=max_results)
-    results = tool.invoke({"query": query})
+    tool = TavilySearch(max_results=max_results)
+    response = tool.invoke({"query": query})
+
+    if not isinstance(response, dict):
+        raise TypeError("Tavily search response must be a mapping.")
+    if response.get("error") is not None:
+        raise RuntimeError("Tavily search failed.")
+
+    results = response.get("results")
+    if not isinstance(results, list):
+        raise TypeError("Tavily search response must contain a results list.")
 
     normalized: List[dict] = []
-    for result in results or []:
+    for result in results:
         normalized.append(
             {
                 "title": result.get("title") or "",

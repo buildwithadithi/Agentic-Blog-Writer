@@ -120,6 +120,13 @@ class OAuthAuthorizationFlow:
         self._redirect_handler = self._capture_authorization_url
         self._callback_handler = self._wait_for_callback
 
+    @property
+    def is_pending(self) -> bool:
+        return (
+            self._connection_task is not None
+            and not self._connection_task.done()
+        )
+
     async def get_authorization_url(self) -> str | None:
         if self._connection_task is not None and not self._connection_task.done():
             raise RuntimeError("WordPress authorization is already in progress.")

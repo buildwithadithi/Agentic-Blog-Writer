@@ -77,9 +77,11 @@ class WordPressMCPClient:
         *,
         redirect_uri: str = REDIRECT_URI,
         token_storage: OAuthTokenStorage | None = None,
+        close_after_connect: bool = False,
         redirect_handler: Callable[[str], Awaitable[None]] | None = None,
         callback_handler: Callable[[], Awaitable[AuthorizationCodeResult]] | None = None,
     ):
+        self._close_after_connect = close_after_connect
         self.token_storage = (
             token_storage if token_storage is not None else FileTokenStorage()
         )
@@ -256,7 +258,10 @@ class WordPressMCPClient:
 
             await self.session.initialize()
 
-            print("Connected to WordPress!")
+            if self._close_after_connect:
+                await self._close_connection_resources()
+            else:
+                print("Connected to WordPress!")
 
         except BaseException:
 
@@ -276,13 +281,18 @@ class WordPressMCPClient:
         await self.authorization_flow.cancel()
 
         if self.exit_stack is not None:
+            await self._close_connection_resources()
+            print("WordPress connection closed.")
 
-            await self.exit_stack.aclose()
-
+    async def _close_connection_resources(self):
+        exit_stack = self.exit_stack
+        if exit_stack is None:
+            return
+        try:
+            await exit_stack.aclose()
+        finally:
             self.exit_stack = None
             self.session = None
-
-            print("WordPress connection closed.")
 
     # --------------------------------------------------------
     # INTERNAL TOOL EXECUTION

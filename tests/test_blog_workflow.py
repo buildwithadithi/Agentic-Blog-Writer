@@ -8,12 +8,15 @@ import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from typing import TypedDict
 from unittest.mock import AsyncMock, patch
 
 os.environ.setdefault("GOOGLE_API_KEY", "unit-test-placeholder")
 
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import interrupt
 
 from blog_writer.models import (
     EvidenceItem,
@@ -374,6 +377,142 @@ class WorkflowIntegrationTests(unittest.IsolatedAsyncioTestCase):
             (Path(self.previous_cwd) / "images" / "test-diagram.png").exists()
         )
 
+    async def test_streaming_reports_actual_nodes_and_parallel_worker_sections(self):
+        thread_id = "streamed-workflow-thread"
+        checkpointer = MemorySaver(serde=create_checkpoint_serializer())
+        graph = workflow.build_workflow_graph(checkpointer)
+        runtime = workflow.WorkflowRuntime.from_checkpointer(
+            checkpointer,
+            graph=graph,
+        )
+        events = []
+
+        response = await runtime.start_workflow_stream(
+            "A test blog topic",
+            "2026-11-26",
+            thread_id,
+            events.append,
+        )
+
+        started = [
+            event for event in events if event["event"] == "node_started"
+        ]
+        completed = [
+            event for event in events if event["event"] == "node_completed"
+        ]
+        started_workers = {
+            event["section_id"]
+            for event in started
+            if event["node"] == "worker"
+        }
+        completed_workers = {
+            event["section_id"]
+            for event in completed
+            if event["node"] == "worker"
+        }
+
+        self.assertEqual(response["thread_id"], thread_id)
+        self.assertEqual(response["status"], "paused")
+        self.assertEqual(response["interrupt"]["message"], "Review the generated blog")
+        self.assertIn("router", {event["node"] for event in completed})
+        self.assertIn("orchestrator", {event["node"] for event in completed})
+        self.assertIn("merge_content", {event["node"] for event in completed})
+        self.assertIn("decide_images", {event["node"] for event in completed})
+        self.assertIn(
+            "generate_and_place_images",
+            {event["node"] for event in completed},
+        )
+        self.assertEqual(started_workers, {1, 2})
+        self.assertEqual(completed_workers, {1, 2})
+        self.assertIn(
+            "human_review",
+            {
+                event["node"]
+                for event in events
+                if event["event"] == "node_interrupted"
+            },
+        )
+        await runtime.shutdown()
+
+    async def test_streaming_reports_research_only_for_research_route(self):
+        self.fake_llm.needs_research = True
+        checkpointer = MemorySaver(serde=create_checkpoint_serializer())
+        graph = workflow.build_workflow_graph(checkpointer)
+        runtime = workflow.WorkflowRuntime.from_checkpointer(
+            checkpointer,
+            graph=graph,
+        )
+        events = []
+
+        response = await runtime.start_workflow_stream(
+            "A current-events blog topic",
+            "2026-11-26",
+            "research-stream-thread",
+            events.append,
+        )
+
+        completed_nodes = {
+            event["node"]
+            for event in events
+            if event["event"] == "node_completed"
+        }
+        self.assertEqual(response["status"], "paused")
+        self.assertIn("research", completed_nodes)
+        await runtime.shutdown()
+
+    async def test_streaming_resumes_review_checkpoint_with_same_thread_id(self):
+        thread_id = "review-resume-stream-thread"
+        graph, _ = await self.start_until_review(thread_id=thread_id)
+        runtime = workflow.WorkflowRuntime.from_checkpointer(
+            graph.checkpointer,
+            graph=graph,
+        )
+        revision_events = []
+
+        revised = await runtime.resume_workflow_stream(
+            thread_id,
+            {
+                "action": "revision_requested",
+                "feedback": "Clarify the conclusion.",
+            },
+            revision_events.append,
+        )
+
+        self.assertEqual(revised["thread_id"], thread_id)
+        self.assertEqual(revised["status"], "paused")
+        self.assertEqual(revised["interrupt"]["revision_count"], 1)
+        self.assertIn(
+            "revision",
+            {event["node"] for event in revision_events},
+        )
+        self.assertIn(
+            "human_review",
+            {event["node"] for event in revision_events},
+        )
+        self.assertIn(
+            "human_review",
+            {
+                event["node"]
+                for event in revision_events
+                if event["event"] == "node_interrupted"
+            },
+        )
+
+        approval_events = []
+        approved = await runtime.resume_workflow_stream(
+            thread_id,
+            {"action": "approved"},
+            approval_events.append,
+        )
+        self.assertEqual(approved["thread_id"], thread_id)
+        self.assertEqual(approved["status"], "completed")
+        self.assertEqual(approved["result"]["review_status"], "approved")
+        self.assertIn(
+            "wordpress_draft",
+            {event["node"] for event in approval_events},
+        )
+        await runtime.shutdown()
+
     async def test_checkpointer_initializer_contract_is_mockable(self):
         pool = SimpleNamespace(close=lambda: None)
         saver = MemorySaver()
@@ -550,6 +689,149 @@ class WorkflowIntegrationTests(unittest.IsolatedAsyncioTestCase):
             call for call in FakeWordPressClient.calls if call[0] == "create_post"
         )
         self.assertEqual(create_call[2], revised["result"]["final"])
+
+    async def test_get_workflow_state_restores_review_checkpoint_without_mutation(self):
+        thread_id = "state-read-review-thread"
+        image_spec = ImageSpec(
+            placeholder="[[IMAGE_1]]",
+            filename="state-diagram.png",
+            alt="State diagram",
+            caption="Workflow state",
+            prompt="A state diagram",
+        )
+        self.fake_llm.image_plan = GlobalImagePlan(
+            md_with_placeholders="# Test Blog\n\n[[IMAGE_1]]",
+            images=[image_spec],
+        )
+        graph, started = await self.start_until_review(thread_id=thread_id)
+        checkpointer = graph.checkpointer
+        config = workflow.make_thread_config(thread_id)["config"]
+        checkpoint_before = checkpointer.get_tuple(config)
+        llm_call_counts = (
+            len(self.fake_llm.structured_calls),
+            len(self.fake_llm.worker_calls),
+            len(self.fake_llm.revision_calls),
+        )
+
+        restored_graph = workflow.build_workflow_graph(checkpointer)
+        restored_runtime = workflow.WorkflowRuntime.from_checkpointer(
+            checkpointer,
+            graph=restored_graph,
+        )
+        state = await restored_runtime.get_workflow_state(thread_id)
+
+        checkpoint_after = checkpointer.get_tuple(config)
+        self.assertEqual(state["thread_id"], thread_id)
+        self.assertEqual(state["status"], "paused_for_review")
+        self.assertEqual(state["topic"], "A test blog topic")
+        self.assertEqual(state["plan"]["blog_title"], "Test Blog")
+        self.assertIsInstance(state["plan"]["tasks"][0]["id"], int)
+        self.assertEqual(state["evidence"], [])
+        self.assertEqual(len(state["sections"]), 2)
+        self.assertEqual(state["final"], started["result"]["final"])
+        self.assertEqual(state["image_specs"][0]["filename"], "state-diagram.png")
+        self.assertEqual(
+            state["image_references"],
+            ["../images/state-diagram.png"],
+        )
+        self.assertEqual(state["review_status"], "")
+        self.assertEqual(state["revision_count"], 0)
+        self.assertEqual(state["interrupted_at"], ["human_review"])
+        self.assertEqual(state["interrupts"][0]["blog"], state["final"])
+        self.assertEqual(state["next"], ["human_review"])
+        self.assertEqual(checkpoint_after.checkpoint, checkpoint_before.checkpoint)
+        self.assertEqual(
+            llm_call_counts,
+            (
+                len(self.fake_llm.structured_calls),
+                len(self.fake_llm.worker_calls),
+                len(self.fake_llm.revision_calls),
+            ),
+        )
+
+    async def test_get_workflow_state_after_revision_and_completion(self):
+        thread_id = "state-read-revision-thread"
+        graph, _ = await self.start_until_review(thread_id=thread_id)
+        checkpointer = graph.checkpointer
+
+        revised = await workflow.resume_workflow(
+            thread_id,
+            {
+                "action": "revision_requested",
+                "feedback": "Add a clearer conclusion.",
+            },
+            graph=graph,
+        )
+        runtime = workflow.WorkflowRuntime.from_checkpointer(
+            checkpointer,
+            graph=workflow.build_workflow_graph(checkpointer),
+        )
+        revision_state = await runtime.get_workflow_state(thread_id)
+        self.assertEqual(revision_state["status"], "paused_for_review")
+        self.assertEqual(revision_state["revision_count"], 1)
+        self.assertEqual(revision_state["final"], revised["result"]["final"])
+
+        approved = await workflow.resume_workflow(
+            thread_id,
+            {"action": "approved"},
+            graph=graph,
+        )
+        completed_state = await workflow.WorkflowRuntime.from_checkpointer(
+            checkpointer,
+            graph=workflow.build_workflow_graph(checkpointer),
+        ).get_workflow_state(thread_id)
+
+        self.assertEqual(approved["status"], "completed")
+        self.assertEqual(completed_state["status"], "completed")
+        self.assertEqual(completed_state["review_status"], "approved")
+        self.assertEqual(completed_state["wordpress_post_id"], 871)
+        self.assertEqual(completed_state["wordpress_status"], "draft")
+
+    async def test_get_workflow_state_distinguishes_non_review_interrupts(self):
+        class InterruptState(TypedDict):
+            topic: str
+
+        def wait_for_external_input(state):
+            interrupt({"message": "Waiting for external input"})
+            return {}
+
+        builder = StateGraph(InterruptState)
+        builder.add_node("external_wait", wait_for_external_input)
+        builder.add_edge(START, "external_wait")
+        builder.add_edge("external_wait", END)
+        checkpointer = MemorySaver(serde=create_checkpoint_serializer())
+        graph = builder.compile(checkpointer=checkpointer)
+        thread_id = "external-interrupt-thread"
+        config = workflow.make_thread_config(thread_id)["config"]
+
+        await graph.ainvoke({"topic": "Test"}, config=config)
+        runtime = workflow.WorkflowRuntime.from_checkpointer(checkpointer, graph=graph)
+        state = await runtime.get_workflow_state(thread_id)
+
+        self.assertEqual(state["status"], "interrupted")
+        self.assertEqual(state["interrupted_at"], ["external_wait"])
+        self.assertEqual(
+            state["interrupts"],
+            [{"message": "Waiting for external input"}],
+        )
+
+    async def test_get_workflow_state_returns_not_found_and_validates_thread_id(self):
+        graph = self.build_test_graph()
+        runtime = workflow.WorkflowRuntime.from_checkpointer(
+            graph.checkpointer,
+            graph=graph,
+        )
+
+        missing = await runtime.get_workflow_state("unknown-thread")
+        self.assertEqual(missing["status"], "not_found")
+        self.assertEqual(missing["thread_id"], "unknown-thread")
+        self.assertIsNone(missing["topic"])
+        self.assertEqual(missing["sections"], [])
+
+        for invalid_thread_id in ("", "   ", None, 42):
+            with self.subTest(thread_id=invalid_thread_id):
+                with self.assertRaisesRegex(ValueError, "thread_id"):
+                    await runtime.get_workflow_state(invalid_thread_id)
 
     async def test_runtime_initialization_retains_pool_saver_and_compiles_graph(self):
         pool = AsyncClosePool()

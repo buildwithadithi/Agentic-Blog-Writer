@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import subprocess
@@ -56,6 +57,21 @@ class AsyncContext:
 
     async def __aexit__(self, exc_type, exc_value, traceback):
         self.exited = True
+
+
+class TaskBoundAsyncContext(AsyncContext):
+    def __init__(self, value):
+        super().__init__(value)
+        self.owner_task = None
+
+    async def __aenter__(self):
+        self.owner_task = asyncio.current_task()
+        return await super().__aenter__()
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        if asyncio.current_task() is not self.owner_task:
+            raise RuntimeError("Async context exited from a different task.")
+        await super().__aexit__(exc_type, exc_value, traceback)
 
 
 class WordPressOAuthTests(unittest.IsolatedAsyncioTestCase):
@@ -271,6 +287,45 @@ class WordPressOAuthTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(http_context.exited)
         self.assertTrue(stream_context.exited)
         self.assertTrue(session_context.exited)
+
+    async def test_oauth_client_closes_resources_in_the_task_that_opened_them(self):
+        client = WordPressMCPClient(
+            token_storage=self.storage,
+            close_after_connect=True,
+        )
+        http_client = SimpleNamespace(auth=None)
+        session = SimpleNamespace(initialize=AsyncMock())
+        http_context = TaskBoundAsyncContext(http_client)
+        stream_context = TaskBoundAsyncContext((object(), object()))
+        session_context = TaskBoundAsyncContext(session)
+
+        with (
+            patch.object(client, "_prepare_oauth_metadata", new=AsyncMock()),
+            patch.object(
+                wordpress_mcp.httpx2,
+                "AsyncClient",
+                return_value=http_context,
+            ),
+            patch.object(
+                wordpress_mcp,
+                "streamable_http_client",
+                return_value=stream_context,
+            ),
+            patch.object(
+                wordpress_mcp,
+                "ClientSession",
+                return_value=session_context,
+            ),
+        ):
+            authorization_url = await client.get_authorization_url()
+            await client.close()
+
+        self.assertIsNone(authorization_url)
+        self.assertTrue(http_context.exited)
+        self.assertTrue(stream_context.exited)
+        self.assertTrue(session_context.exited)
+        self.assertIsNone(client.exit_stack)
+        self.assertIsNone(client.session)
 
     async def test_create_post_stays_a_draft_with_expected_payload(self):
         result = SimpleNamespace(
