@@ -3,7 +3,7 @@ import logging
 import streamlit as st
 
 from streamlit_ui.components.article_review import render_article_review
-from streamlit_ui.components.article_renderer import render_article
+from streamlit_ui.components.article_renderer import normalize_markdown, render_article
 from streamlit_ui.components.progress_panel import render_progress_panel
 from streamlit_ui.components.topic_form import render_topic_form
 from streamlit_ui.components.wordpress_connect import render_wordpress_connection
@@ -58,7 +58,9 @@ def apply_workflow_response(response: dict) -> None:
 
     st.session_state["current_thread_id"] = response["thread_id"]
     st.session_state["current_workflow_status"] = status
-    st.session_state["current_final_markdown"] = result.get("final", "")
+    st.session_state["current_final_markdown"] = normalize_markdown(
+        result.get("final", "")
+    )
     st.session_state["current_revision_count"] = result.get(
         "revision_count",
         interrupt.get("revision_count", 0) if isinstance(interrupt, dict) else 0,

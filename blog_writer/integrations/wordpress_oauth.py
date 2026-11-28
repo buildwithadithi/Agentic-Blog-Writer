@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import secrets
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -67,7 +68,14 @@ class FileTokenStorage:
     async def set_tokens(self, tokens: OAuthToken) -> None:
         data = self._load()
         data["tokens"] = tokens.model_dump(mode="json", exclude_none=True)
+        data["token_issued_at"] = time.time()
         self._save(data)
+
+    async def get_token_issued_at(self) -> float | None:
+        issued_at = self._load().get("token_issued_at")
+        if isinstance(issued_at, (int, float)):
+            return float(issued_at)
+        return None
 
     async def get_client_info(self) -> OAuthClientInformationFull | None:
         client_info = self._load().get("client_info")

@@ -99,10 +99,82 @@ class WordPressOAuthTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await reloaded.get_client_info(), client_info)
         self.assertEqual(
             set(json.loads(self.token_path.read_text(encoding="utf-8"))),
-            {"tokens", "client_info"},
+            {"tokens", "client_info", "token_issued_at"},
         )
+        self.assertIsInstance(await reloaded.get_token_issued_at(), float)
         if os.name == "posix":
             self.assertEqual(self.token_path.stat().st_mode & 0o777, 0o600)
+
+    async def test_legacy_token_storage_without_issue_time_is_treated_as_expired(self):
+        self.token_path.write_text(
+            json.dumps(
+                {
+                    "tokens": {
+                        "access_token": "legacy-access-token",
+                        "token_type": "Bearer",
+                        "expires_in": 3600,
+                        "refresh_token": "legacy-refresh-token",
+                    },
+                    "client_info": make_client_info().model_dump(mode="json"),
+                }
+            ),
+            encoding="utf-8",
+        )
+        client = WordPressMCPClient(token_storage=self.storage)
+
+        await client.oauth_provider._initialize()
+
+        self.assertFalse(client.oauth_provider.context.is_token_valid())
+        self.assertTrue(client.oauth_provider.context.can_refresh_token())
+
+    async def test_expired_persisted_token_uses_discovered_refresh_endpoint(self):
+        await self.storage.set_client_info(make_client_info())
+        await self.storage.set_tokens(
+            OAuthToken(
+                access_token="expired-access-token",
+                token_type="Bearer",
+                expires_in=0,
+                refresh_token="existing-refresh-token",
+                scope="auth",
+            )
+        )
+        client = WordPressMCPClient(token_storage=self.storage)
+        metadata = OAuthMetadata(
+            issuer="https://public-api.wordpress.com",
+            authorization_endpoint="https://auth.example.test/authorize",
+            token_endpoint="https://auth.example.test/custom/oauth/token",
+        )
+        discovery_client = SimpleNamespace()
+
+        async def send(request):
+            if request.url.path.endswith("/.well-known/oauth-authorization-server"):
+                return httpx2.Response(
+                    200,
+                    json=metadata.model_dump(mode="json"),
+                    request=request,
+                )
+            return httpx2.Response(404, request=request)
+
+        discovery_client.send = AsyncMock(side_effect=send)
+        discovery_context = AsyncContext(discovery_client)
+
+        with patch.object(
+            wordpress_mcp.httpx2,
+            "AsyncClient",
+            return_value=discovery_context,
+        ):
+            await client._prepare_oauth_metadata()
+
+        self.assertFalse(client.oauth_provider.context.is_token_valid())
+        refresh_request = await client.oauth_provider._refresh_token()
+        self.assertEqual(
+            str(refresh_request.url),
+            "https://auth.example.test/custom/oauth/token",
+        )
+        self.assertEqual(
+            str(discovery_client.send.await_args_list[-1].args[0].url),
+            "https://public-api.wordpress.com/.well-known/oauth-authorization-server",
+        )
 
     async def test_authorization_url_and_callback_exchange_use_mcp_provider(self):
         client = WordPressMCPClient(
@@ -374,6 +446,9 @@ class WordPressOAuthTests(unittest.IsolatedAsyncioTestCase):
 
             async def connect(self):
                 self.connect_calls += 1
+
+            async def upload_images(self, content, image_specs=None):
+                return content
 
             async def create_post(self, *, title, content, confirmed=False):
                 self.create_calls.append((title, content, confirmed))

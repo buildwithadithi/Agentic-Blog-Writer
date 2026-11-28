@@ -1,6 +1,7 @@
 import html
 import re
 from pathlib import Path
+from typing import Any
 
 import streamlit as st
 
@@ -13,6 +14,24 @@ _IMAGE_SOURCE = re.compile(r"""\bsrc=["']([^"']+)["']""", re.IGNORECASE)
 _IMAGE_ALT = re.compile(r"""\balt=["']([^"']*)["']""", re.IGNORECASE)
 _CODE_FENCE = re.compile(r"(```.*?```|~~~.*?~~~)", re.DOTALL)
 _IMAGE_PREFIX = "../images/"
+
+
+def normalize_markdown(markdown: Any) -> str:
+    if isinstance(markdown, str):
+        return markdown
+    if isinstance(markdown, list):
+        text_parts = []
+        for item in markdown:
+            if isinstance(item, str):
+                text_parts.append(item)
+            elif (
+                isinstance(item, dict)
+                and item.get("type", "text") == "text"
+                and isinstance(item.get("text"), str)
+            ):
+                text_parts.append(item["text"])
+        return "\n".join(part for part in text_parts if part)
+    raise TypeError("Article content must be Markdown text or a list of text blocks.")
 
 
 def _local_image_path(reference: str) -> Path | None:
@@ -57,8 +76,14 @@ def _render_markdown_with_images(markdown: str) -> None:
         st.markdown(remaining_markdown)
 
 
-def render_article(markdown: str) -> None:
+def render_article(markdown: Any) -> None:
     """Render Markdown safely and display existing local reducer image artifacts."""
+    try:
+        markdown = normalize_markdown(markdown)
+    except TypeError:
+        st.error("The generated article content has an unsupported format.")
+        return
+
     if not markdown:
         st.info("No generated blog content is available yet.")
         return

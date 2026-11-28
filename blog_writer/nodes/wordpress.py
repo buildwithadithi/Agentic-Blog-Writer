@@ -34,6 +34,11 @@ async def wordpress_draft_node(state: State) -> dict:
     try:
         await client.connect()
 
+        content = await client.upload_images(
+            content,
+            state.get("image_specs", []),
+        )
+
         post = await client.create_post(
             title=title,
             content=content,

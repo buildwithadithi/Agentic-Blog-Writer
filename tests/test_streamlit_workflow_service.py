@@ -49,10 +49,20 @@ def workflow_response(
 
 
 class FakeWorkflowRuntime:
-    def __init__(self, *, status="paused", failure=None, resume_failure=None):
+    def __init__(
+        self,
+        *,
+        status="paused",
+        failure=None,
+        resume_failure=None,
+        final_content=None,
+    ):
         self.status = status
         self.failure = failure
         self.resume_failure = resume_failure
+        self.final_content = final_content or (
+            "# A Generated Blog\n\nA paragraph with **formatting**."
+        )
         self.started_workflows = []
         self.resumed_workflows = []
         self.shutdown_calls = 0
@@ -64,7 +74,7 @@ class FakeWorkflowRuntime:
         return workflow_response(
             thread_id,
             status=self.status,
-            final="# A Generated Blog\n\nA paragraph with **formatting**.",
+            final=self.final_content,
         )
 
     async def start_workflow_stream(
@@ -128,7 +138,7 @@ class FakeWorkflowRuntime:
         return workflow_response(
             thread_id,
             status=self.status,
-            final="# A Generated Blog\n\nA paragraph with **formatting**.",
+            final=self.final_content,
         )
 
     async def resume_workflow_stream(
@@ -415,6 +425,43 @@ class WorkflowServiceTests(unittest.TestCase):
 
 
 class ArticleRendererTests(unittest.TestCase):
+    def test_renders_list_of_text_content_blocks_as_markdown(self):
+        content = [
+            {"type": "text", "text": "# Article title"},
+            {"type": "image", "image_url": "not-rendered-by-markdown"},
+            {"type": "text", "text": "A paragraph with **formatting**."},
+        ]
+        with patch.object(article_renderer.st, "markdown") as markdown:
+            article_renderer.render_article(content)
+
+        markdown.assert_called_once_with(
+            "# Article title\nA paragraph with **formatting**."
+        )
+
+    def test_normalizes_plain_string_and_mixed_text_blocks(self):
+        self.assertEqual(
+            article_renderer.normalize_markdown(
+                ["First paragraph", {"text": "Second paragraph"}]
+            ),
+            "First paragraph\nSecond paragraph",
+        )
+        self.assertEqual(
+            article_renderer.normalize_markdown("# Already Markdown"),
+            "# Already Markdown",
+        )
+
+    def test_unsupported_content_type_shows_safe_error(self):
+        with (
+            patch.object(article_renderer.st, "markdown") as markdown,
+            patch.object(article_renderer.st, "error") as error,
+        ):
+            article_renderer.render_article({"unexpected": "content"})
+
+        markdown.assert_not_called()
+        error.assert_called_once_with(
+            "The generated article content has an unsupported format."
+        )
+
     def test_displays_local_image_at_its_markdown_position(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             previous_cwd = os.getcwd()
@@ -553,11 +600,13 @@ class StreamlitWorkflowAppTests(unittest.TestCase):
         status="paused",
         failure=None,
         resume_failure=None,
+        final_content=None,
     ):
         runtime = FakeWorkflowRuntime(
             status=status,
             failure=failure,
             resume_failure=resume_failure,
+            final_content=final_content,
         )
         factory_calls = []
 
@@ -633,6 +682,29 @@ class StreamlitWorkflowAppTests(unittest.TestCase):
             self.assertEqual(app.session_state["current_thread_id"], thread_id)
             self.assertEqual(len(factory_calls), 1)
             self.assertTrue(manager_provider.call_count >= 2)
+
+    def test_list_content_blocks_are_normalized_before_review_and_session_storage(self):
+        content = [
+            {"type": "text", "text": "# Generated from blocks"},
+            {"type": "text", "text": "Article body."},
+        ]
+        with self._run_app_with_runtime(final_content=content) as (
+            app,
+            _,
+            _,
+            _,
+        ):
+            app.text_input[0].set_value("Block content topic")
+            click_button(app, "Generate Blog")
+            app.run()
+
+            expected = "# Generated from blocks\nArticle body."
+            self.assertFalse(app.exception)
+            self.assertEqual(
+                app.session_state["current_final_markdown"],
+                expected,
+            )
+            self.assertTrue(any("Generated from blocks" in item.value for item in app.markdown))
 
     def test_approval_resumes_the_paused_thread_and_completes(self):
         with self._run_app_with_runtime() as (app, runtime, _, _):

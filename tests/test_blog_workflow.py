@@ -111,6 +111,9 @@ class FakeWordPressClient:
     async def connect(self):
         self.calls.append(("connect",))
 
+    async def upload_images(self, content, image_specs=None):
+        return content
+
     async def create_post(self, *, title, content, confirmed=False):
         self.calls.append(("create_post", title, content, confirmed))
         return {

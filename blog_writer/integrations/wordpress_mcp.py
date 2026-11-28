@@ -1,8 +1,14 @@
 
+import base64
+import hashlib
+import html
 import json
+import re
 from contextlib import AsyncExitStack
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Protocol
+from urllib.parse import unquote
 
 import httpx2
 
@@ -32,6 +38,28 @@ WORDPRESS_SITE = "https://buildwithadithi.wordpress.com"
 
 REDIRECT_URI = "http://localhost:8080/callback"
 
+_IMAGE_TAG = re.compile(r"<img\b(?P<attributes>[^>]*)>", re.IGNORECASE)
+_IMAGE_SOURCE = re.compile(
+    r"""(?P<prefix>\bsrc\s*=\s*)(?P<quote>["'])(?P<source>.*?)(?P=quote)""",
+    re.IGNORECASE,
+)
+_CODE_FENCE = re.compile(r"(```.*?```|~~~.*?~~~)", re.DOTALL)
+_LOCAL_IMAGE_PREFIX = "../images/"
+_IMAGE_FORMATS = (
+    (".png", "image/png", lambda data: data.startswith(b"\x89PNG\r\n\x1a\n")),
+    (".jpg", "image/jpeg", lambda data: data.startswith(b"\xff\xd8\xff")),
+    (".gif", "image/gif", lambda data: data.startswith((b"GIF87a", b"GIF89a"))),
+    (
+        ".webp",
+        "image/webp",
+        lambda data: (
+            len(data) >= 12
+            and data[:4] == b"RIFF"
+            and data[8:12] == b"WEBP"
+        ),
+    ),
+)
+_SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 
 _notebook_redirect_handler: Callable[[str], Awaitable[None]] | None = None
 _notebook_callback_handler: Callable[[], Awaitable[AuthorizationCodeResult]] | None = None
@@ -97,7 +125,7 @@ class WordPressMCPClient:
             scope="auth"
         )
 
-        self.oauth_provider = OAuthClientProvider(
+        self.oauth_provider = WordPressOAuthClientProvider(
             server_url=WORDPRESS_MCP_URL,
             client_metadata=self.client_metadata,
             storage=self.token_storage,
@@ -451,6 +479,204 @@ class WordPressMCPClient:
 
         return post
 
+    async def upload_images(
+        self,
+        content: str,
+        image_specs: list[dict] | None = None,
+    ) -> str:
+        if not isinstance(content, str):
+            raise TypeError("WordPress draft content must be Markdown text.")
+
+        references = self._local_image_references(content)
+        if not references:
+            return content
+
+        specs_by_filename = {
+            spec.get("filename"): spec
+            for spec in (image_specs or [])
+            if isinstance(spec, dict) and isinstance(spec.get("filename"), str)
+        }
+        prepared_images = []
+        for reference, filename in references.items():
+            path = self._resolve_local_image(filename)
+            image_bytes = path.read_bytes()
+            image_format = self._detect_image_format(image_bytes)
+            if (
+                path.suffix.lower() not in _SUPPORTED_IMAGE_EXTENSIONS
+                or image_format is None
+            ):
+                raise ValueError(
+                    f"Generated image {filename!r} has an unsupported or invalid image format."
+                )
+            upload_extension, mime_type = image_format
+            image_hash = hashlib.sha256(image_bytes).hexdigest()
+            spec = specs_by_filename.get(filename, {})
+            prepared_images.append(
+                {
+                    "reference": reference,
+                    "filename": filename,
+                    "upload_filename": f"{path.stem}{upload_extension}",
+                    "bytes": image_bytes,
+                    "mime_type": mime_type,
+                    "sha256": image_hash,
+                    "title": f"Blog Writer {image_hash} {filename}",
+                    "alt_text": spec.get("alt", ""),
+                    "caption": spec.get("caption", ""),
+                }
+            )
+
+        replacement_urls = {}
+        for image in prepared_images:
+            existing = await self._find_uploaded_image(
+                image["title"],
+                image["mime_type"],
+            )
+            if existing is None:
+                existing = await self._create_uploaded_image(image)
+            replacement_urls[image["reference"]] = existing["source_url"]
+
+        def replace_image_tag(tag_match):
+            tag = tag_match.group(0)
+            source_match = _IMAGE_SOURCE.search(tag)
+            if source_match is None:
+                return tag
+            reference = html.unescape(source_match.group("source"))
+            url = replacement_urls.get(reference)
+            if url is None:
+                return tag
+            replacement = (
+                source_match.group("prefix")
+                + source_match.group("quote")
+                + html.escape(url, quote=True)
+                + source_match.group("quote")
+            )
+            return (
+                tag[:source_match.start()]
+                + replacement
+                + tag[source_match.end():]
+            )
+
+        return "".join(
+            segment
+            if segment.startswith(("```", "~~~"))
+            else _IMAGE_TAG.sub(replace_image_tag, segment)
+            for segment in _CODE_FENCE.split(content)
+        )
+
+    @staticmethod
+    def _local_image_references(content: str) -> dict[str, str]:
+        references = {}
+        for segment in _CODE_FENCE.split(content):
+            if segment.startswith(("```", "~~~")):
+                continue
+            for tag_match in _IMAGE_TAG.finditer(segment):
+                source_match = _IMAGE_SOURCE.search(tag_match.group(0))
+                if source_match is None:
+                    continue
+                reference = html.unescape(source_match.group("source"))
+                if not reference.startswith(_LOCAL_IMAGE_PREFIX):
+                    continue
+                filename = unquote(reference[len(_LOCAL_IMAGE_PREFIX):])
+                if (
+                    not filename
+                    or Path(filename).name != filename
+                    or filename in {".", ".."}
+                    or "?" in filename
+                    or "#" in filename
+                ):
+                    raise ValueError(
+                        "Generated image reference is not a valid local path."
+                    )
+                references[reference] = filename
+        return references
+
+    @staticmethod
+    def _resolve_local_image(filename: str) -> Path:
+        image_root = (Path.cwd() / "images").resolve()
+        try:
+            image_path = (image_root / filename).resolve(strict=True)
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(
+                f"Generated image {filename!r} was not found in the local images directory."
+            ) from exc
+        if image_path.parent != image_root or not image_path.is_file():
+            raise ValueError("Generated image reference is outside the images directory.")
+        return image_path
+
+    @staticmethod
+    def _detect_image_format(image_bytes: bytes) -> tuple[str, str] | None:
+        for extension, mime_type, signature_matches in _IMAGE_FORMATS:
+            if signature_matches(image_bytes):
+                return extension, mime_type
+        return None
+
+    async def _find_uploaded_image(
+        self,
+        title: str,
+        mime_type: str,
+    ) -> dict | None:
+        data = await self._execute(
+            name="wpcom-mcp/media-list",
+            input_data={
+                "wpcom_site": WORDPRESS_SITE,
+                "media_type": ["image"],
+                "search": title,
+                "per_page": 100,
+                "include_fields": ["id", "title", "source_url", "mime_type"],
+            },
+        )
+        if isinstance(data, dict):
+            items = data.get("data", data.get("items", data.get("media", [])))
+        else:
+            items = data
+        if not isinstance(items, list):
+            raise RuntimeError("WordPress media lookup returned an unexpected response.")
+
+        for item in items:
+            if (
+                isinstance(item, dict)
+                and item.get("title") == title
+                and item.get("mime_type") == mime_type
+                and isinstance(item.get("id"), int)
+                and isinstance(item.get("source_url"), str)
+                and item["source_url"].startswith("https://")
+            ):
+                return {
+                    "id": item["id"],
+                    "source_url": item["source_url"],
+                }
+        return None
+
+    async def _create_uploaded_image(self, image: dict) -> dict:
+        await self._execute(
+            name="wpcom/media-create",
+            summary=(
+                "Upload the approved blog article image "
+                f"{image['filename']} to the WordPress media library."
+            ),
+            confirmed=True,
+            input_data={
+                "wpcom_site": WORDPRESS_SITE,
+                "file_content_base64": base64.b64encode(
+                    image["bytes"]
+                ).decode("ascii"),
+                "filename": image["upload_filename"],
+                "mime_type": image["mime_type"],
+                "title": image["title"],
+                "alt_text": image["alt_text"],
+                "caption": image["caption"],
+            },
+        )
+        uploaded = await self._find_uploaded_image(
+            image["title"],
+            image["mime_type"],
+        )
+        if uploaded is None:
+            raise RuntimeError(
+                "WordPress did not return the uploaded image in its media library."
+            )
+        return uploaded
+
     # --------------------------------------------------------
     # GET POST
     # --------------------------------------------------------
@@ -561,6 +787,30 @@ class WordPressMCPClient:
             print("\nURL:", post["link"])
 
         print("=" * 38)
+
+
+class WordPressOAuthClientProvider(OAuthClientProvider):
+    async def _initialize(self) -> None:
+        await super()._initialize()
+        tokens = self.context.current_tokens
+        if tokens is None or tokens.expires_in is None:
+            return
+
+        get_token_issued_at = getattr(
+            self.context.storage,
+            "get_token_issued_at",
+            None,
+        )
+        issued_at = (
+            await get_token_issued_at()
+            if get_token_issued_at is not None
+            else None
+        )
+        self.context.token_expiry_time = (
+            issued_at + tokens.expires_in
+            if issued_at is not None
+            else 1.0
+        )
 
 
 _parse_callback_url = parse_callback_url
