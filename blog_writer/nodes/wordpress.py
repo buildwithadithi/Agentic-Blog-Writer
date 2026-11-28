@@ -1,4 +1,7 @@
-from blog_writer.integrations.wordpress_mcp import WordPressMCPClient
+from blog_writer.integrations.wordpress_mcp import (
+    WordPressMCPClient,
+    markdown_to_wordpress_html,
+)
 from blog_writer.state import State
 
 
@@ -38,6 +41,7 @@ async def wordpress_draft_node(state: State) -> dict:
             content,
             state.get("image_specs", []),
         )
+        content = markdown_to_wordpress_html(content)
 
         post = await client.create_post(
             title=title,

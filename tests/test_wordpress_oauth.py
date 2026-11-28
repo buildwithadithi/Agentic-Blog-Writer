@@ -473,7 +473,10 @@ class WordPressOAuthTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(fake_client.connect_calls, 1)
-        self.assertEqual(fake_client.create_calls, [("Mock title", "Mock content", True)])
+        self.assertEqual(
+            fake_client.create_calls,
+            [("Mock title", "<p>Mock content</p>\n", True)],
+        )
         self.assertEqual(fake_client.close_calls, 1)
         self.assertEqual(result["wordpress_status"], "draft")
 

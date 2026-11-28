@@ -279,7 +279,8 @@ class WorkflowIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(create_calls), 1)
         _, title, content, confirmed = create_calls[0]
         self.assertEqual(title, "A test blog topic")
-        self.assertEqual(content, started["result"]["final"])
+        self.assertTrue(content.startswith("<h1>"))
+        self.assertIn(started["result"]["final"].splitlines()[0][2:], content)
         self.assertTrue(confirmed)
         self.assertIn(("close",), FakeWordPressClient.calls)
         self.assertNotEqual(approved["result"]["wordpress_status"], "publish")
@@ -328,7 +329,10 @@ class WorkflowIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(approved["status"], "completed")
         self.assertEqual(approved["result"]["final"], "# Human Edited Blog\n\nThe human wording.")
         create_call = next(call for call in FakeWordPressClient.calls if call[0] == "create_post")
-        self.assertEqual(create_call[2], "# Human Edited Blog\n\nThe human wording.")
+        self.assertEqual(
+            create_call[2],
+            "<h1>Human Edited Blog</h1>\n<p>The human wording.</p>\n",
+        )
 
     async def test_scenario_f_revision_limit_routes_to_manual_intervention(self):
         graph, _ = await self.start_until_review(thread_id="revision-limit-thread")
@@ -691,7 +695,10 @@ class WorkflowIntegrationTests(unittest.IsolatedAsyncioTestCase):
         create_call = next(
             call for call in FakeWordPressClient.calls if call[0] == "create_post"
         )
-        self.assertEqual(create_call[2], revised["result"]["final"])
+        self.assertEqual(
+            create_call[2],
+            "<h1>Revised Blog</h1>\n<p>Updated after feedback.</p>\n",
+        )
 
     async def test_get_workflow_state_restores_review_checkpoint_without_mutation(self):
         thread_id = "state-read-review-thread"

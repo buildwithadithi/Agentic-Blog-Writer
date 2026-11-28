@@ -12,6 +12,8 @@ from urllib.parse import unquote
 
 import httpx2
 
+from markdown_it import MarkdownIt
+
 from pydantic import AnyUrl
 
 from mcp import ClientSession
@@ -44,7 +46,16 @@ _IMAGE_SOURCE = re.compile(
     re.IGNORECASE,
 )
 _CODE_FENCE = re.compile(r"(```.*?```|~~~.*?~~~)", re.DOTALL)
+_IMAGE_ALT = re.compile(
+    r"""\balt\s*=\s*(?P<quote>["'])(?P<alt>.*?)(?P=quote)""",
+    re.IGNORECASE,
+)
+_IMAGE_WIDTH = re.compile(
+    r"""\bwidth\s*=\s*(?P<quote>["']?)(?P<width>\d+)(?P=quote)""",
+    re.IGNORECASE,
+)
 _LOCAL_IMAGE_PREFIX = "../images/"
+_WORDPRESS_MARKDOWN = MarkdownIt("commonmark", {"html": False})
 _IMAGE_FORMATS = (
     (".png", "image/png", lambda data: data.startswith(b"\x89PNG\r\n\x1a\n")),
     (".jpg", "image/jpeg", lambda data: data.startswith(b"\xff\xd8\xff")),
@@ -63,6 +74,77 @@ _SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 
 _notebook_redirect_handler: Callable[[str], Awaitable[None]] | None = None
 _notebook_callback_handler: Callable[[], Awaitable[AuthorizationCodeResult]] | None = None
+
+
+def markdown_to_wordpress_html(markdown: str) -> str:
+    if not isinstance(markdown, str):
+        raise TypeError("WordPress draft content must be Markdown text.")
+
+    protected_images = {}
+    image_index = 0
+
+    def protect_image(match):
+        nonlocal image_index
+        attributes = match.group("attributes")
+        source_match = _IMAGE_SOURCE.search(match.group(0))
+        if source_match is None:
+            return match.group(0)
+
+        source = html.unescape(source_match.group("source"))
+        if not source.startswith(("https://", "http://")):
+            raise ValueError("WordPress image URLs must use HTTP or HTTPS.")
+
+        alt_match = _IMAGE_ALT.search(attributes)
+        alt_text = html.unescape(alt_match.group("alt")) if alt_match else ""
+        width_match = _IMAGE_WIDTH.search(attributes)
+        width = (
+            min(int(width_match.group("width")), 650)
+            if width_match
+            else 650
+        )
+        image_html = (
+            f'<img src="{html.escape(source, quote=True)}" '
+            f'alt="{html.escape(alt_text, quote=True)}" '
+            f'width="{width}" style="max-width:100%;height:auto;">'
+        )
+        token = f"WORDPRESSIMAGEPLACEHOLDER{image_index}TOKEN"
+        image_index += 1
+        protected_images[token] = image_html
+        return token
+
+    safe_markdown = "".join(
+        segment
+        if segment.startswith(("```", "~~~"))
+        else _IMAGE_TAG.sub(protect_image, segment)
+        for segment in _CODE_FENCE.split(markdown)
+    )
+    rendered = _WORDPRESS_MARKDOWN.render(safe_markdown)
+    for token, image_html in protected_images.items():
+        rendered = rendered.replace(token, image_html)
+    rendered = re.sub(
+        r"<img\b(?P<attributes>[^>]*?)(?P<close>\s*/?)>",
+        lambda match: _add_image_size_limit(match),
+        rendered,
+        flags=re.IGNORECASE,
+    )
+    return rendered
+
+
+def _add_image_size_limit(match: re.Match[str]) -> str:
+    attributes = match.group("attributes")
+    width_match = _IMAGE_WIDTH.search(attributes)
+    if width_match:
+        width = min(int(width_match.group("width")), 650)
+        attributes = (
+            attributes[:width_match.start()]
+            + f'width="{width}"'
+            + attributes[width_match.end():]
+        )
+    else:
+        attributes += ' width="650"'
+    if "style=" not in attributes.lower():
+        attributes += ' style="max-width:100%;height:auto;"'
+    return f"<img{attributes}{match.group('close')}>"
 
 
 class OAuthTokenStorage(Protocol):

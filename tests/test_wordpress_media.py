@@ -6,7 +6,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from blog_writer.integrations.wordpress_mcp import WordPressMCPClient
+from blog_writer.integrations.wordpress_mcp import (
+    WordPressMCPClient,
+    markdown_to_wordpress_html,
+)
 from blog_writer.nodes import wordpress
 
 
@@ -98,6 +101,49 @@ class WordPressMediaTests(unittest.IsolatedAsyncioTestCase):
 
     def write_png(self, filename):
         (self.image_dir / filename).write_bytes(PNG_BYTES)
+
+    def test_markdown_is_converted_to_wordpress_html(self):
+        rendered = markdown_to_wordpress_html(
+            "# RAG Overview\n\n"
+            "## Retrieval\n\n"
+            "A **grounded** answer with [fresh sources](https://example.test).\n\n"
+            "1. Retrieve relevant documents.\n"
+            "2. Generate an answer.\n\n"
+            "![Architecture](https://media.example.test/rag.jpg)"
+        )
+
+        self.assertIn("<h1>RAG Overview</h1>", rendered)
+        self.assertIn("<h2>Retrieval</h2>", rendered)
+        self.assertIn("<strong>grounded</strong>", rendered)
+        self.assertIn(
+            '<a href="https://example.test">fresh sources</a>',
+            rendered,
+        )
+        self.assertIn("<ol>", rendered)
+        self.assertIn(
+            '<img src="https://media.example.test/rag.jpg" alt="Architecture" '
+            'width="650" style="max-width:100%;height:auto;" />',
+            rendered,
+        )
+
+    def test_existing_uploaded_image_html_is_preserved_safely(self):
+        rendered = markdown_to_wordpress_html(
+            '<img src="https://media.example.test/rag.jpg" alt="RAG" width="900">'
+        )
+
+        self.assertIn(
+            '<img src="https://media.example.test/rag.jpg" alt="RAG" '
+            'width="650" style="max-width:100%;height:auto;">',
+            rendered,
+        )
+
+    def test_raw_html_is_escaped_in_wordpress_content(self):
+        rendered = markdown_to_wordpress_html(
+            '<script>alert("unsafe")</script>'
+        )
+
+        self.assertNotIn("<script>", rendered)
+        self.assertIn("&lt;script&gt;", rendered)
 
     async def test_upload_replaces_local_reference_and_sends_confirmed_payload(self):
         self.write_png("cover.png")
@@ -269,7 +315,8 @@ class WordPressMediaTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.create_post.await_count, 2)
         self.assertEqual(
             client.create_post.await_args.kwargs["content"],
-            '<img src="https://media.example.test/cover.png">',
+            '<p><img src="https://media.example.test/cover.png" alt="" '
+            'width="650" style="max-width:100%;height:auto;"></p>\n',
         )
 
 
